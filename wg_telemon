@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+source /etc/telemon.env
+
+# send text alert to Telegram
+send() {
+  curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+       -d "chat_id=${CHAT_ID}" \
+       --data-urlencode "text=$1" >/dev/null
+}
+
+# 1) Container run check
+if ! docker inspect -f '{{.State.Running}}' "${WG_CONTAINER}" 2>/dev/null | grep -q true; then
+  send "🚨 ${WG_CONTAINER} not running!"
+  exit 0
+fi
+
+# 2) Interface existence
+link=$(docker exec "${WG_CONTAINER}" ip link show "${WG_IFACE}" 2>/dev/null) || {
+  send "🚨 ${WG_IFACE} missing!"
+  exit 0
+}
+
+# 3) Interface UP flag
+flags=$(echo "$link" | head -1 | sed -n 's/.*<\(.*\)>.*/\1/p')
+if ! echo "$flags" | grep -qw UP; then
+  send "⚠️ ${WG_IFACE} is DOWN (${flags})"
+  exit 0
+fi
+
+# 4) Handshake age
+alerts=()
+while IFS= read -r line; do
+  if [[ $line == peer:* ]]; then
+    peer=${line#peer:\ }
+  elif [[ $line =~ latest[[:space:]]handshake:[[:space:]]([0-9]+|never) ]]; then
+    val=${BASH_REMATCH[1]}
+    if [[ $val == never ]] || (( val > THRESHOLD )); then
+      alerts+=("Peer $peer ➜ handshake ${val}s ago")
+    fi
+  fi
+done < <(docker exec "${WG_CONTAINER}" wg show "${WG_IFACE}")
+
+if ((${#alerts[@]})); then
+  send "⚠️ WG issues:\n$(printf '%s\n' "${alerts[@]}")"
+fi
