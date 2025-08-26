@@ -1,45 +1,571 @@
 #!/usr/bin/env bash
-source /etc/telemon.env
+set -euo pipefail
 
-# send text alert to Telegram
-send() {
-  curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-       -d "chat_id=${CHAT_ID}" \
-       --data-urlencode "text=$1" >/dev/null
+# WireGuard Docker Monitor - Enhanced Version
+# Monitors WireGuard containers and sends Telegram alerts
+
+# Configuration
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_VERSION="2.0"
+readonly CONFIG_FILE="${WG_MONITOR_CONFIG:-/etc/telemon.env}"
+readonly LOG_FILE="${WG_MONITOR_LOG:-/var/log/wg-monitor.log}"
+readonly LOCK_FILE="/var/run/wg-monitor.lock"
+
+# Default values
+readonly DEFAULT_THRESHOLD=300
+readonly DEFAULT_INTERFACE="wg0"
+readonly DEFAULT_LOG_LEVEL="INFO"
+
+# Colors for console output
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly NC='\033[0m' # No Color
+
+# Global variables
+declare -A ALERT_COUNTERS
+declare -A LAST_ALERTS
+declare -a FAILED_CHECKS
+
+# Logging function
+log() {
+    local level="$1"
+    local message="$2"
+    local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    
+    # Log to file
+    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    
+    # Log to console based on log level
+    case "$level" in
+        ERROR)   echo -e "${RED}[ERROR] $message${NC}" >&2 ;;
+        WARN)    echo -e "${YELLOW}[WARN] $message${NC}" >&2 ;;
+        INFO)    echo -e "${GREEN}[INFO] $message${NC}" ;;
+        DEBUG)   [[ "${LOG_LEVEL:-INFO}" == "DEBUG" ]] && echo -e "${BLUE}[DEBUG] $message${NC}" ;;
+    esac
 }
 
-# 1) Container run check
-if ! docker inspect -f '{{.State.Running}}' "${WG_CONTAINER}" 2>/dev/null | grep -q true; then
-  send "🚨 ${WG_CONTAINER} not running!"
-  exit 0
-fi
-
-# 2) Interface existence
-link=$(docker exec "${WG_CONTAINER}" ip link show "${WG_IFACE}" 2>/dev/null) || {
-  send "🚨 ${WG_IFACE} missing!"
-  exit 0
-}
-
-# 3) Interface UP flag
-flags=$(echo "$link" | head -1 | sed -n 's/.*<\(.*\)>.*/\1/p')
-if ! echo "$flags" | grep -qw UP; then
-  send "⚠️ ${WG_IFACE} is DOWN (${flags})"
-  exit 0
-fi
-
-# 4) Handshake age
-alerts=()
-while IFS= read -r line; do
-  if [[ $line == peer:* ]]; then
-    peer=${line#peer:\ }
-  elif [[ $line =~ latest[[:space:]]handshake:[[:space:]]([0-9]+|never) ]]; then
-    val=${BASH_REMATCH[1]}
-    if [[ $val == never ]] || (( val > THRESHOLD )); then
-      alerts+=("Peer $peer ➜ handshake ${val}s ago")
+# Configuration validation
+validate_config() {
+    local errors=0
+    
+    log "DEBUG" "Validating configuration..."
+    
+    # Required variables
+    for var in BOT_TOKEN CHAT_ID; do
+        if [[ -z "${!var:-}" ]]; then
+            log "ERROR" "Required variable $var is not set"
+            ((errors++))
+        fi
+    done
+    
+    # Validate bot token format
+    if [[ -n "${BOT_TOKEN:-}" ]] && [[ ! "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{35}$ ]]; then
+        log "WARN" "BOT_TOKEN format looks suspicious"
     fi
-  fi
-done < <(docker exec "${WG_CONTAINER}" wg show "${WG_IFACE}")
+    
+    # Validate chat ID
+    if [[ -n "${CHAT_ID:-}" ]] && [[ ! "$CHAT_ID" =~ ^-?[0-9]+$ ]]; then
+        log "ERROR" "CHAT_ID must be numeric"
+        ((errors++))
+    fi
+    
+    # Validate threshold
+    if [[ -n "${THRESHOLD:-}" ]] && [[ ! "$THRESHOLD" =~ ^[0-9]+$ ]]; then
+        log "ERROR" "THRESHOLD must be a positive integer"
+        ((errors++))
+    fi
+    
+    return $errors
+}
 
-if ((${#alerts[@]})); then
-  send "⚠️ WG issues:\n$(printf '%s\n' "${alerts[@]}")"
+# Load configuration
+load_config() {
+    log "DEBUG" "Loading configuration from $CONFIG_FILE"
+    
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log "ERROR" "Configuration file not found: $CONFIG_FILE"
+        exit 1
+    fi
+    
+    # Source the config file safely
+    set -a
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+    set +a
+    
+    # Set defaults
+    WG_CONTAINERS="${WG_CONTAINERS:-$WG_CONTAINER}"
+    WG_IFACE="${WG_IFACE:-$DEFAULT_INTERFACE}"
+    THRESHOLD="${THRESHOLD:-$DEFAULT_THRESHOLD}"
+    LOG_LEVEL="${LOG_LEVEL:-$DEFAULT_LOG_LEVEL}"
+    ALERT_COOLDOWN="${ALERT_COOLDOWN:-3600}"
+    MAX_RETRIES="${MAX_RETRIES:-3}"
+    
+    validate_config
+}
+
+# Enhanced Telegram sender with retry logic
+send_telegram() {
+    local message="$1"
+    local parse_mode="${2:-Markdown}"
+    local retries=0
+    local max_retries="${MAX_RETRIES:-3}"
+    
+    while ((retries < max_retries)); do
+        local response
+        response=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            -d "parse_mode=${parse_mode}" \
+            --data-urlencode "text=$message" 2>/dev/null)
+        
+        local http_code="${response##*$'\n'}"
+        local response_body="${response%$'\n'*}"
+        
+        if [[ "$http_code" == "200" ]]; then
+            log "DEBUG" "Telegram message sent successfully"
+            return 0
+        else
+            ((retries++))
+            log "WARN" "Failed to send Telegram message (attempt $retries/$max_retries): HTTP $http_code"
+            [[ $retries -lt $max_retries ]] && sleep $((retries * 2))
+        fi
+    done
+    
+    log "ERROR" "Failed to send Telegram message after $max_retries attempts"
+    return 1
+}
+
+# Check if alert is in cooldown period
+is_alert_in_cooldown() {
+    local alert_key="$1"
+    local current_time=$(date +%s)
+    local last_alert_time="${LAST_ALERTS[$alert_key]:-0}"
+    
+    if ((current_time - last_alert_time < ALERT_COOLDOWN)); then
+        log "DEBUG" "Alert '$alert_key' is in cooldown period"
+        return 0
+    fi
+    
+    return 1
+}
+
+# Send alert with cooldown management
+send_alert() {
+    local alert_key="$1"
+    local message="$2"
+    local level="${3:-WARN}"
+    
+    if is_alert_in_cooldown "$alert_key"; then
+        return 0
+    fi
+    
+    local icon
+    case "$level" in
+        ERROR) icon="🚨" ;;
+        WARN)  icon="⚠️" ;;
+        INFO)  icon="ℹ️" ;;
+        *)     icon="📟" ;;
+    esac
+    
+    local formatted_message
+    formatted_message="$icon *WireGuard Monitor Alert*
+
+🖥️ *Host:* \`$(hostname)\`
+🕐 *Time:* \`$(date '+%Y-%m-%d %H:%M:%S')\`
+📊 *Level:* $level
+
+$message"
+    
+    if send_telegram "$formatted_message"; then
+        LAST_ALERTS["$alert_key"]=$(date +%s)
+        ALERT_COUNTERS["$alert_key"]=$((${ALERT_COUNTERS[$alert_key]:-0} + 1))
+        log "INFO" "Alert sent: $alert_key"
+    fi
+}
+
+# Enhanced container check
+check_container() {
+    local container="$1"
+    local alert_key="container_${container}"
+    
+    log "DEBUG" "Checking container: $container"
+    
+    # Check if container exists
+    if ! docker inspect "$container" >/dev/null 2>&1; then
+        send_alert "$alert_key" "🐳 Container \`$container\` does not exist!" "ERROR"
+        return 1
+    fi
+    
+    # Check if container is running
+    local state
+    state=$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null)
+    
+    if [[ "$state" != "running" ]]; then
+        local uptime=""
+        if [[ "$state" == "exited" ]]; then
+            local exit_code
+            exit_code=$(docker inspect -f '{{.State.ExitCode}}' "$container" 2>/dev/null)
+            uptime=" (Exit code: $exit_code)"
+        fi
+        
+        send_alert "$alert_key" "🐳 Container \`$container\` is not running!
+📊 *Status:* $state$uptime" "ERROR"
+        return 1
+    fi
+    
+    # Check container health if health check is configured
+    local health
+    health=$(docker inspect -f '{{.State.Health.Status}}' "$container" 2>/dev/null || echo "none")
+    if [[ "$health" != "none" && "$health" != "healthy" ]]; then
+        send_alert "${alert_key}_health" "🩺 Container \`$container\` health check failed!
+📊 *Health Status:* $health" "WARN"
+    fi
+    
+    log "DEBUG" "Container $container is running (health: $health)"
+    return 0
+}
+
+# Enhanced interface check
+check_interface() {
+    local container="$1"
+    local interface="$2"
+    local alert_key="interface_${container}_${interface}"
+    
+    log "DEBUG" "Checking interface $interface in container $container"
+    
+    # Check if interface exists
+    local link_info
+    if ! link_info=$(docker exec "$container" ip link show "$interface" 2>/dev/null); then
+        send_alert "$alert_key" "🌐 Interface \`$interface\` not found in container \`$container\`!" "ERROR"
+        return 1
+    fi
+    
+    # Parse interface flags
+    local flags
+    flags=$(echo "$link_info" | head -1 | sed -n 's/.*<\(.*\)>.*/\1/p')
+    
+    # Check if interface is UP
+    if ! echo "$flags" | grep -qw UP; then
+        send_alert "$alert_key" "🌐 Interface \`$interface\` is DOWN in container \`$container\`!
+📊 *Flags:* $flags" "ERROR"
+        return 1
+    fi
+    
+    # Get additional interface statistics
+    local stats
+    stats=$(docker exec "$container" cat "/sys/class/net/$interface/statistics/rx_bytes" 2>/dev/null || echo "0")
+    log "DEBUG" "Interface $interface is UP (RX bytes: $stats)"
+    
+    return 0
+}
+
+# Enhanced peer handshake check
+check_peer_handshakes() {
+    local container="$1"
+    local interface="$2"
+    local threshold="$3"
+    local alert_key="handshake_${container}_${interface}"
+    
+    log "DEBUG" "Checking peer handshakes for $interface in $container"
+    
+    local wg_output
+    if ! wg_output=$(docker exec "$container" wg show "$interface" 2>/dev/null); then
+        send_alert "$alert_key" "❌ Failed to get WireGuard status for \`$interface\` in \`$container\`" "ERROR"
+        return 1
+    fi
+    
+    local current_peer=""
+    local peer_count=0
+    local stale_peers=()
+    local never_peers=()
+    local active_peers=0
+    local current_time=$(date +%s)
+    
+    while IFS= read -r line; do
+        if [[ $line =~ ^peer:\ (.+)$ ]]; then
+            current_peer="${BASH_REMATCH[1]}"
+            ((peer_count++))
+        elif [[ $line =~ ^[[:space:]]*latest\ handshake:\ (.+)$ ]]; then
+            local handshake="${BASH_REMATCH[1]}"
+            
+            if [[ "$handshake" == "never" ]]; then
+                never_peers+=("$current_peer")
+            else
+                # Convert handshake time to seconds ago
+                local handshake_time
+                handshake_time=$(date -d "$handshake" +%s 2>/dev/null || echo "0")
+                local age=$((current_time - handshake_time))
+                
+                if ((age > threshold)); then
+                    stale_peers+=("$current_peer (${age}s ago)")
+                else
+                    ((active_peers++))
+                fi
+            fi
+        fi
+    done <<< "$wg_output"
+    
+    # Prepare alert message if there are issues
+    local issues=()
+    [[ ${#never_peers[@]} -gt 0 ]] && issues+=("📭 *Never connected:* ${#never_peers[@]} peer(s)")
+    [[ ${#stale_peers[@]} -gt 0 ]] && issues+=("⏰ *Stale handshakes:* ${#stale_peers[@]} peer(s)")
+    
+    if [[ ${#issues[@]} -gt 0 ]]; then
+        local message="🔒 WireGuard handshake issues in \`$container/$interface\`:
+
+$(printf '%s\n' "${issues[@]}")
+
+📊 *Summary:*
+• Total peers: $peer_count
+• Active peers: $active_peers
+• Threshold: ${threshold}s"
+        
+        # Add details for never-connected peers
+        if [[ ${#never_peers[@]} -gt 0 && ${#never_peers[@]} -le 5 ]]; then
+            message+="\n\n📭 *Never connected peers:*"
+            for peer in "${never_peers[@]}"; do
+                message+="\n• \`${peer:0:16}...\`"
+            done
+        fi
+        
+        # Add details for stale peers
+        if [[ ${#stale_peers[@]} -gt 0 && ${#stale_peers[@]} -le 5 ]]; then
+            message+="\n\n⏰ *Stale handshake peers:*"
+            for peer_info in "${stale_peers[@]}"; do
+                message+="\n• \`${peer_info:0:20}...\`"
+            done
+        fi
+        
+        send_alert "$alert_key" "$message" "WARN"
+        return 1
+    fi
+    
+    log "DEBUG" "All $peer_count peers have recent handshakes (active: $active_peers)"
+    return 0
+}
+
+# Main monitoring function for a single container
+monitor_container() {
+    local container="$1"
+    local interface="${2:-$WG_IFACE}"
+    local threshold="${3:-$THRESHOLD}"
+    
+    log "INFO" "Monitoring container: $container (interface: $interface, threshold: ${threshold}s)"
+    
+    local checks_passed=0
+    local total_checks=3
+    
+    # Check 1: Container status
+    if check_container "$container"; then
+        ((checks_passed++))
+    else
+        FAILED_CHECKS+=("Container $container is not running")
+        return 1
+    fi
+    
+    # Check 2: Interface status
+    if check_interface "$container" "$interface"; then
+        ((checks_passed++))
+    else
+        FAILED_CHECKS+=("Interface $interface in $container has issues")
+        return 1
+    fi
+    
+    # Check 3: Peer handshakes
+    if check_peer_handshakes "$container" "$interface" "$threshold"; then
+        ((checks_passed++))
+    else
+        FAILED_CHECKS+=("Peer handshakes in $container/$interface have issues")
+    fi
+    
+    log "DEBUG" "Container $container: $checks_passed/$total_checks checks passed"
+    return $((total_checks - checks_passed))
+}
+
+# Health check endpoint (for external monitoring)
+health_check() {
+    local health_file="/tmp/wg-monitor-health"
+    local current_time=$(date +%s)
+    
+    echo "$current_time" > "$health_file"
+    
+    if [[ ${#FAILED_CHECKS[@]} -eq 0 ]]; then
+        log "INFO" "Health check: OK"
+        exit 0
+    else
+        log "WARN" "Health check: FAILED (${#FAILED_CHECKS[@]} issues)"
+        exit 1
+    fi
+}
+
+# Cleanup function
+cleanup() {
+    [[ -f "$LOCK_FILE" ]] && rm -f "$LOCK_FILE"
+    log "DEBUG" "Cleanup completed"
+}
+
+# Signal handlers
+trap cleanup EXIT
+trap 'log "INFO" "Received SIGTERM, shutting down..."; exit 0' TERM
+trap 'log "INFO" "Received SIGINT, shutting down..."; exit 0' INT
+
+# Show usage
+usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME [OPTIONS]
+
+Enhanced WireGuard Docker Monitor v$SCRIPT_VERSION
+
+OPTIONS:
+    -c, --config FILE     Configuration file (default: $CONFIG_FILE)
+    -l, --log-level LEVEL Log level: DEBUG, INFO, WARN, ERROR (default: INFO)
+    -h, --health          Run health check and exit
+    -t, --test            Test configuration and send test message
+    -v, --version         Show version and exit
+    --help                Show this help message
+
+EXAMPLES:
+    $SCRIPT_NAME                    # Run with default config
+    $SCRIPT_NAME -l DEBUG           # Run with debug logging
+    $SCRIPT_NAME -h                 # Health check
+    $SCRIPT_NAME -t                 # Test configuration
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -c|--config)
+                CONFIG_FILE="$2"
+                shift 2
+                ;;
+            -l|--log-level)
+                LOG_LEVEL="$2"
+                shift 2
+                ;;
+            -h|--health)
+                RUN_HEALTH_CHECK=1
+                shift
+                ;;
+            -t|--test)
+                RUN_TEST=1
+                shift
+                ;;
+            -v|--version)
+                echo "$SCRIPT_NAME v$SCRIPT_VERSION"
+                exit 0
+                ;;
+            --help)
+                usage
+                exit 0
+                ;;
+            *)
+                log "ERROR" "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# Test function
+run_test() {
+    log "INFO" "Running configuration test..."
+    
+    if load_config; then
+        log "INFO" "Configuration loaded successfully"
+        
+        # Test Telegram connectivity
+        local test_message="🧪 *Test Message*
+
+This is a test message from WireGuard Monitor v$SCRIPT_VERSION
+
+🖥️ *Host:* \`$(hostname)\`
+🕐 *Time:* \`$(date '+%Y-%m-%d %H:%M:%S')\`
+
+Configuration test completed successfully! ✅"
+        
+        if send_telegram "$test_message"; then
+            log "INFO" "Test message sent successfully"
+            exit 0
+        else
+            log "ERROR" "Failed to send test message"
+            exit 1
+        fi
+    else
+        log "ERROR" "Configuration test failed"
+        exit 1
+    fi
+}
+
+# Main function
+main() {
+    # Create lock file
+    if [[ -f "$LOCK_FILE" ]]; then
+        local lock_pid
+        lock_pid=$(<"$LOCK_FILE")
+        if kill -0 "$lock_pid" 2>/dev/null; then
+            log "WARN" "Another instance is already running (PID: $lock_pid)"
+            exit 0
+        else
+            log "INFO" "Removing stale lock file"
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    
+    echo $$ > "$LOCK_FILE"
+    
+    # Initialize logging
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+    
+    log "INFO" "Starting WireGuard Monitor v$SCRIPT_VERSION"
+    
+    # Load configuration
+    load_config
+    
+    # Handle special modes
+    [[ "${RUN_HEALTH_CHECK:-0}" -eq 1 ]] && health_check
+    [[ "${RUN_TEST:-0}" -eq 1 ]] && run_test
+    
+    # Parse container list
+    IFS=' ' read -ra CONTAINERS <<< "$WG_CONTAINERS"
+    
+    if [[ ${#CONTAINERS[@]} -eq 0 ]]; then
+        log "ERROR" "No containers specified in configuration"
+        exit 1
+    fi
+    
+    log "INFO" "Monitoring ${#CONTAINERS[@]} container(s): ${CONTAINERS[*]}"
+    
+    # Monitor each container
+    local total_issues=0
+    for container in "${CONTAINERS[@]}"; do
+        if ! monitor_container "$container"; then
+            ((total_issues++))
+        fi
+    done
+    
+    # Send summary if there were issues
+    if [[ $total_issues -gt 0 ]]; then
+        log "WARN" "Monitoring completed with $total_issues issue(s)"
+    else
+        log "INFO" "All checks passed successfully"
+    fi
+    
+    # Cleanup old log entries (keep last 1000 lines)
+    if [[ -f "$LOG_FILE" ]] && [[ $(wc -l < "$LOG_FILE") -gt 1000 ]]; then
+        tail -1000 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+    fi
+}
+
+# Script entry point
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    parse_args "$@"
+    main
 fi
