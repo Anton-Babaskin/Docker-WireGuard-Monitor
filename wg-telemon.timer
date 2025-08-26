@@ -1,0 +1,27 @@
+[Unit]
+Description=Run WireGuard Telegram Monitor periodically
+Documentation=https://github.com/your-org/wg-telemon
+Requires=wg-telemon.service
+
+[Timer]
+# Start 2 minutes after boot to ensure all services are ready
+OnBootSec=2min
+
+# Run every 2 minutes (adjustable based on needs)
+# Options: 1min, 2min, 5min, 10min
+OnUnitActiveSec=2min
+
+# Randomize execution time by up to 30 seconds to prevent thundering herd
+RandomizedDelaySec=30s
+
+# High precision timing (default is 1min, we want more precise scheduling)
+AccuracySec=10s
+
+# Persistent timer - catch up if system was down
+Persistent=true
+
+# Prevent timer from starting if the service is already running
+Unit=wg-telemon.service
+
+[Install]
+WantedBy=timers.target
