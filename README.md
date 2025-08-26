@@ -493,7 +493,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - **Issues**: [GitHub Issues](https://github.com/Anton-Babaskin/Docker-WireGuard-Monitor/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/Anton-Babaskin/Docker-WireGuard-Monitor/discussions)
-- **Email**: [support@example.com](mailto:support@example.com)
+- **Email**: [support@example.com](mailto:me@fy-consulting.com)
 
 ---
 
