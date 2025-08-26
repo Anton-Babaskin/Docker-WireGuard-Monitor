@@ -1,0 +1,104 @@
+name: 🏷️ Auto Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  release:
+    name: 🚀 Create Release
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Get version from tag
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          # Extract changelog section for this version
+          if [ -f "CHANGELOG.md" ]; then
+            awk "/^## \[${{ steps.get_version.outputs.VERSION }}\]/,/^## \[/{if(/^## \[/ && !/^## \[${{ steps.get_version.outputs.VERSION }}\]/) exit; print}" CHANGELOG.md > release_notes.md
+          else
+            echo "Release ${{ steps.get_version.outputs.VERSION }}" > release_notes.md
+          fi
+          
+      - name: Create release archive
+        run: |
+          # Create comprehensive release package
+          mkdir -p release/wireguard-monitor-${{ steps.get_version.outputs.VERSION }}
+          
+          # Copy main files
+          cp wg_telemon release/wireguard-monitor-${{ steps.get_version.outputs.VERSION }}/
+          cp install.sh release/wireguard-monitor-${{ steps.get_version.outputs.VERSION }}/
+          cp telemon.env release/wireguard-monitor-${{ steps.get_version.outputs.VERSION }}/
+          cp wg-telemon.service release/wireguard-monitor-${{ steps.get_version.outputs.VERSION }}/  
+          cp wg-telemon.timer release/wireguard-monitor-${{ steps.get_version.outputs.VERSION }}/
+          
+          # Copy documentation
+          cp README.md release/wireguard-monitor-${{ steps.get_version.outputs.VERSION }}/
+          cp EXAMPLES.md release/wireguard-monitor-${{ steps.get_version.outputs.VERSION }}/
+          cp CHANGELOG.md release/wireguard-monitor-${{ steps.get_version.outputs.VERSION }}/
+          
+          # Create quick install script
+          cat > release/wireguard-monitor-${{ steps.get_version.outputs.VERSION }}/quick-install.sh << 'EOF'
+          #!/bin/bash
+          echo "🛡️ WireGuard Monitor Quick Installer v${{ steps.get_version.outputs.VERSION }}"
+          echo "Starting installation..."
+          
+          if [ "$EUID" -ne 0 ]; then
+            echo "❌ Please run as root (sudo)"
+            exit 1
+          fi
+          
+          # Run the main installer
+          bash ./install.sh
+          EOF
+          
+          chmod +x release/wireguard-monitor-${{ steps.get_version.outputs.VERSION }}/quick-install.sh
+          chmod +x release/wireguard-monitor-${{ steps.get_version.outputs.VERSION }}/install.sh
+          chmod +x release/wireguard-monitor-${{ steps.get_version.outputs.VERSION }}/wg_telemon
+          
+          # Create archives
+          cd release
+          tar -czf wireguard-monitor-${{ steps.get_version.outputs.VERSION }}.tar.gz wireguard-monitor-${{ steps.get_version.outputs.VERSION }}/
+          zip -r wireguard-monitor-${{ steps.get_version.outputs.VERSION }}.zip wireguard-monitor-${{ steps.get_version.outputs.VERSION }}/
+          
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum wireguard-monitor-${{ steps.get_version.outputs.VERSION }}.tar.gz > checksums.txt
+          sha256sum wireguard-monitor-${{ steps.get_version.outputs.VERSION }}.zip >> checksums.txt
+          
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.get_version.outputs.TAG }}
+          name: 🛡️ WireGuard Monitor v${{ steps.get_version.outputs.VERSION }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          files: |
+            release/wireguard-monitor-${{ steps.get_version.outputs.VERSION }}.tar.gz
+            release/wireguard-monitor-${{ steps.get_version.outputs.VERSION }}.zip
+            release/checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Update installation URLs
+        run: |
+          echo "🎉 Release created successfully!"
+          echo ""  
+          echo "📦 Installation options:"
+          echo "curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/wireguard-monitor-${{ steps.get_version.outputs.VERSION }}.tar.gz | tar -xzv"
+          echo "wget https://github.com/${{ github.repository }}/releases/latest/download/wireguard-monitor-${{ steps.get_version.outputs.VERSION }}.tar.gz"
