@@ -1,12 +1,5 @@
 # 🛡️ WireGuard Docker Monitor - Enhanced
 
-[![CI](https://github.com/Anton-Babaskin/Docker-WireGuard-Monitor/workflows/CI%2FCD%20Pipeline/badge.svg)](https://github.com/Anton-Babaskin/Docker-WireGuard-Monitor/actions)
-[![Security](https://github.com/Anton-Babaskin/Docker-WireGuard-Monitor/workflows/Security%20Scan/badge.svg)](https://github.com/Anton-Babaskin/Docker-WireGuard-Monitor/security)
-[![Release](https://img.shields.io/github/v/release/Anton-Babaskin/Docker-WireGuard-Monitor)](https://github.com/Anton-Babaskin/Docker-WireGuard-Monitor/releases)
-[![Downloads](https://img.shields.io/github/downloads/Anton-Babaskin/Docker-WireGuard-Monitor/total)](https://github.com/Anton-Babaskin/Docker-WireGuard-Monitor/releases)
-
-
-
 [![Version](https://img.shields.io/badge/version-2.0-blue.svg)](https://github.com/Anton-Babaskin/Docker-WireGuard-Monitor)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Bash](https://img.shields.io/badge/bash-4.4%2B-orange.svg)](https://www.gnu.org/software/bash/)
