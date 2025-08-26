@@ -1,0 +1,43 @@
+[Unit]
+Description=WireGuard Telegram Monitor - Enhanced
+Documentation=https://github.com/your-org/wg-telemon
+Wants=docker.service network-online.target
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log /var/run /tmp
+
+# Environment
+Environment=WG_MONITOR_CONFIG=/etc/telemon.env
+Environment=WG_MONITOR_LOG=/var/log/wg-monitor.log
+
+# Execution
+ExecStartPre=/usr/bin/docker version
+ExecStart=/usr/local/bin/wg_telemon.sh
+ExecStartPost=/bin/bash -c 'echo "Last run: $(date)" > /var/run/wg-monitor-last-run'
+
+# Resource limits
+TimeoutStartSec=60s
+TimeoutStopSec=10s
+
+# Restart policy for failed runs
+Restart=on-failure
+RestartSec=30s
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wg-telemon
+
+[Install]
+WantedBy=multi-user.target
